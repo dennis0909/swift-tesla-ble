@@ -1,0 +1,5 @@
+--disable redundantSendable
+
+--ifdef outdent
+
+--test-case-name-format standard-identifiers

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.swift text eol=lf
+*.pb.swift -diff
+build/TeslaCommand.xcframework/** binary
