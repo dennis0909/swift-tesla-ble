@@ -1,6 +1,12 @@
 import CoreBluetooth
 import Foundation
 
+/// Internal CoreBluetooth wrapper that scans for, connects to, and exchanges
+/// framed messages with a Tesla vehicle's GATT service. Owns the CBCentralManager
+/// lifecycle and the `disconnected → scanning → connecting → connected` state
+/// machine. BLE-layer failures surface as `BLEError`; the Dispatcher maps those
+/// onto the public `TeslaBLEError` cases (e.g. `.notConnected`, `.timeout`,
+/// `.disconnected`). Not public.
 @preconcurrency
 final class BLETransport: NSObject, Sendable {
     enum ConnectionState {

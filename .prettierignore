@@ -1,0 +1,4 @@
+.build/
+Sources/TeslaBLE/Generated/
+Tests/TeslaBLETests/Fixtures/
+Vendor/

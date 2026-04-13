@@ -61,7 +61,7 @@ final class VehicleSnapshotMapperTests: XCTestCase {
         XCTAssertEqual(snapshot.drive?.speedMph ?? 0, 42.0, accuracy: 0.001)
     }
 
-    func testMapDriveOnlyReturnsDriveDTO() {
+    func testMapDriveOnlyReturnsDriveState() {
         var data = CarServer_VehicleData()
         var drive = CarServer_DriveState()
         var shift = CarServer_ShiftState()

@@ -1,11 +1,10 @@
 import Foundation
 
-/// Length-prefixed framing used by Tesla BLE's TX/RX characteristics.
-///
-/// Every message is preceded by a 2-byte big-endian length header, then the
-/// payload is split into MTU-sized chunks for the actual GATT writes. The
-/// receiver buffers incoming bytes and calls `decode(_:)` to extract a
-/// complete message once the full length has arrived.
+/// Framing for Tesla BLE's TX/RX characteristics: every message carries a
+/// 2-byte big-endian length header (`[lenHi, lenLo, payload...]`) and is then
+/// split into MTU-sized chunks for the actual GATT writes, since CoreBluetooth
+/// writes are capped by the negotiated MTU. `decode(_:)` reassembles the stream
+/// on the receiving side, returning the payload once the full length has arrived.
 enum MessageFramer {
     /// Encodes `payload` with a 2-byte big-endian length prefix.
     static func encode(_ payload: Data) -> Data {
