@@ -1,4 +1,5 @@
 .build/
-Sources/TeslaBLE/Generated/
-Tests/TeslaBLETests/Fixtures/
+Assets.xcassets/
+Fixtures/
+Generated/
 Vendor/
