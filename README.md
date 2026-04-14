@@ -1,5 +1,11 @@
 # Swift Tesla BLE
 
+[![CI](https://github.com/shoujiaxin/swift-tesla-ble/actions/workflows/ci.yml/badge.svg)](https://github.com/shoujiaxin/swift-tesla-ble/actions/workflows/ci.yml)
+[![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white)](https://swift.org)
+[![Platforms](https://img.shields.io/badge/Platforms-iOS%2017-blue)](https://github.com/shoujiaxin/swift-tesla-ble)
+[![SwiftPM](https://img.shields.io/badge/SwiftPM-compatible-brightgreen)](https://swift.org/package-manager)
+[![License](https://img.shields.io/github/license/shoujiaxin/swift-tesla-ble)](./LICENSE)
+
 Pure-Swift package for talking to Tesla vehicles directly over Bluetooth LE. One `TeslaVehicleClient` actor handles scanning, connection, per-domain session handshake, signed command dispatch, and structured state/query responses — no Go toolchain, no `gomobile`, no xcframework.
 
 ## Capabilities
