@@ -884,6 +884,80 @@ final class DispatcherTests: XCTestCase {
         throw Dispatcher.Error.timeout
     }
 
+    // MARK: - Protocol-layer fault surfacing
+
+    /// Vehicles report protocol-layer errors as a bare `signedMessageStatus`
+    /// with no `signatureData`. The dispatcher must surface the fault name
+    /// instead of falling through to the verifier's opaque
+    /// `missingSignatureData`. Mirrors `protocol.GetError` in Go.
+    @available(macOS 13.0, iOS 16.0, *)
+    func testDispatcherSurfacesSignedMessageFaultBeforeVerify() async throws {
+        let transport = FakeTransport()
+        let dispatcher = Dispatcher(transport: transport)
+        try await dispatcher.start()
+        let session = makeSession(domain: .infotainment)
+        await dispatcher.installSession(session, forDomain: .infotainment)
+
+        let sendTask = Task { () throws -> Data in
+            try await dispatcher.send(Data("getVehicleData".utf8), domain: .infotainment, timeout: .seconds(2))
+        }
+
+        let outboundBytes = try await waitForFirstOutbound(transport)
+        let outboundRequest = try UniversalMessage_RoutableMessage(serializedBytes: outboundBytes)
+
+        var response = UniversalMessage_RoutableMessage()
+        stampRouting(on: &response, respondingTo: outboundRequest, domain: .infotainment)
+        response.requestUuid = outboundRequest.uuid
+        var status = UniversalMessage_MessageStatus()
+        status.signedMessageFault = .rrorInsufficientPrivileges
+        response.signedMessageStatus = status
+        try await transport.enqueueInbound(response.serializedData())
+
+        do {
+            _ = try await sendTask.value
+            XCTFail("expected protocol fault to be surfaced")
+        } catch let Dispatcher.Error.decodingFailed(msg) {
+            XCTAssertTrue(msg.contains("protocol fault"), "unexpected message: \(msg)")
+            XCTAssertTrue(msg.contains("rrorInsufficientPrivileges"), "should name the fault: \(msg)")
+        }
+
+        await dispatcher.stop()
+    }
+
+    /// `operationStatus == .rror` without a fault code also must be surfaced.
+    @available(macOS 13.0, iOS 16.0, *)
+    func testDispatcherSurfacesOperationStatusError() async throws {
+        let transport = FakeTransport()
+        let dispatcher = Dispatcher(transport: transport)
+        try await dispatcher.start()
+        let session = makeSession(domain: .infotainment)
+        await dispatcher.installSession(session, forDomain: .infotainment)
+
+        let sendTask = Task { () throws -> Data in
+            try await dispatcher.send(Data("x".utf8), domain: .infotainment, timeout: .seconds(2))
+        }
+
+        let outboundBytes = try await waitForFirstOutbound(transport)
+        let outboundRequest = try UniversalMessage_RoutableMessage(serializedBytes: outboundBytes)
+
+        var response = UniversalMessage_RoutableMessage()
+        stampRouting(on: &response, respondingTo: outboundRequest, domain: .infotainment)
+        response.requestUuid = outboundRequest.uuid
+        var status = UniversalMessage_MessageStatus()
+        status.operationStatus = .rror
+        response.signedMessageStatus = status
+        try await transport.enqueueInbound(response.serializedData())
+
+        do {
+            _ = try await sendTask.value
+            XCTFail("expected operation error to be surfaced")
+        } catch let Dispatcher.Error.decodingFailed(msg) {
+            XCTAssertTrue(msg.contains("operation error"), "unexpected message: \(msg)")
+        }
+
+        await dispatcher.stop()
+    }
+
     // MARK: - Per-domain routing semantics
 
     /// VCSEC signed responses are matched on `toDestination.routingAddress`

@@ -137,6 +137,21 @@ actor Dispatcher {
             throw Error.timeout
         }
 
+        // Protocol-layer fault check. Vehicles return errors as a bare
+        // `signedMessageStatus` with no `signatureData`, so we must surface
+        // the fault here — otherwise the verifier below throws the opaque
+        // `missingSignatureData`. Mirrors `protocol.GetError` in Go.
+        if response.hasSignedMessageStatus {
+            let status = response.signedMessageStatus
+            if status.signedMessageFault != .rrorNone {
+                let name = String(describing: status.signedMessageFault)
+                throw Error.decodingFailed("protocol fault on domain \(domain): \(name)")
+            }
+            if status.operationStatus == .rror {
+                throw Error.decodingFailed("operation error on domain \(domain)")
+            }
+        }
+
         // Verify response.
         do {
             return try await session.verify(response: response, requestID: responseMatchID)
