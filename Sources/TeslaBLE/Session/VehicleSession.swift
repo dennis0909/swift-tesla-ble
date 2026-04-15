@@ -31,13 +31,23 @@ actor VehicleSession {
     let sessionKey: SessionKey
 
     /// Vehicle-advertised 16-byte epoch. Rotates when the vehicle requests
-    /// a resync; refreshed via `resync(epoch:counter:)`.
+    /// a resync; refreshed via `resync(fromSessionInfo:)`.
     private var epoch: Data
     /// Monotonically-increasing outbound counter. Incremented before each
     /// `sign` call and rolled back if sealing fails.
     private var counter: UInt32
     /// Sliding replay window over inbound counters. Reset on `resync`.
     private var window: CounterWindow
+
+    /// Wall-clock moment the vehicle's current epoch (according to its
+    /// monotonic clock) would have started, computed as
+    /// `handshakeDate - clockTime seconds`. Used to compute outbound
+    /// `expiresAt` in the vehicle's epoch timebase — the vehicle rejects
+    /// commands whose `expiresAt` is less than `timeSince(sessionStart)`,
+    /// so this MUST be set from `SessionInfo.clockTime` received at
+    /// handshake (see `internal/authentication/signer.go` `NewSigner` +
+    /// `epochStartTime`). Refreshed on `resync(fromSessionInfo:)`.
+    private var sessionStart: Date
 
     init(
         domain: UniversalMessage_Domain,
@@ -46,6 +56,8 @@ actor VehicleSession {
         sessionKey: SessionKey,
         epoch: Data,
         initialCounter: UInt32 = 0,
+        clockTime: UInt32 = 0,
+        handshakeDate: Date = Date(),
     ) {
         self.domain = domain
         self.verifierName = verifierName
@@ -54,18 +66,26 @@ actor VehicleSession {
         self.epoch = epoch
         counter = initialCounter
         window = CounterWindow()
+        sessionStart = handshakeDate.addingTimeInterval(-TimeInterval(clockTime))
     }
 
     /// Outbound sign: increments counter, seals plaintext into message.
+    ///
+    /// `expiresIn` is a relative TTL. The absolute `expiresAt` written into
+    /// the message is `floor(secondsSinceSessionStart + expiresIn)` — i.e.
+    /// a timestamp in the vehicle's epoch timebase, matching
+    /// `signer.go` `encryptWithCounter`:
+    /// `uint32(time.Now().Add(expiresIn).Sub(s.timeZero) / time.Second)`.
     func sign(
         plaintext: Data,
         into message: inout UniversalMessage_RoutableMessage,
-        expiresAt: UInt32,
+        expiresIn: TimeInterval,
     ) throws {
         if counter == UInt32.max {
             throw Error.counterRollover
         }
         counter &+= 1
+        let expiresAt = Self.computeExpiresAt(sessionStart: sessionStart, expiresIn: expiresIn)
         do {
             try OutboundSigner.signGCM(
                 plaintext: plaintext,
@@ -113,12 +133,30 @@ actor VehicleSession {
         return result.plaintext
     }
 
-    /// Update the session's epoch and counter to match a fresh SessionInfo
-    /// received from the vehicle (e.g. after an error-triggered resync).
-    func resync(epoch: Data, counter: UInt32) {
-        self.epoch = epoch
-        self.counter = counter
+    /// Resync this session to a freshly-received (and HMAC-verified)
+    /// `SessionInfo`. Updates epoch, counter, and sessionStart atomically
+    /// and resets the inbound replay window. Called from the dispatcher
+    /// inbound loop when the vehicle proactively attaches updated session
+    /// info to a response (see `internal/authentication/signer.go`
+    /// `UpdateSessionInfo`).
+    ///
+    /// The caller is responsible for HMAC-verifying `info` before calling
+    /// this method — this function does not re-verify.
+    func resync(fromSessionInfo info: Signatures_SessionInfo, handshakeDate: Date = Date()) {
+        epoch = info.epoch
+        counter = info.counter
         window = CounterWindow()
+        sessionStart = handshakeDate.addingTimeInterval(-TimeInterval(info.clockTime))
+    }
+
+    // MARK: - Helpers
+
+    /// `floor((now - sessionStart) + expiresIn)` clamped to `UInt32`.
+    private static func computeExpiresAt(sessionStart: Date, expiresIn: TimeInterval) -> UInt32 {
+        let delta = Date().timeIntervalSince(sessionStart) + expiresIn
+        guard delta.isFinite, delta > 0 else { return 0 }
+        let clamped = min(delta, TimeInterval(UInt32.max))
+        return UInt32(clamped.rounded(.down))
     }
 
 // Test-only accessors.
@@ -129,6 +167,10 @@ actor VehicleSession {
 
     var currentEpoch: Data {
         epoch
+    }
+
+    var currentSessionStart: Date {
+        sessionStart
     }
 #endif
 }

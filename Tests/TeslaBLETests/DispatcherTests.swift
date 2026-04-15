@@ -18,7 +18,7 @@ final class DispatcherTests: XCTestCase {
 
         async let received: UniversalMessage_RoutableMessage = withCheckedThrowingContinuation { cont in
             do {
-                try box.table.register(uuid: uuid, continuation: cont)
+                try box.table.register(token: uuid, continuation: cont)
             } catch {
                 cont.resume(throwing: error)
             }
@@ -29,7 +29,7 @@ final class DispatcherTests: XCTestCase {
 
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = uuid
-        let found = box.table.complete(uuid: uuid, with: response)
+        let found = box.table.complete(token: uuid, with: response)
         XCTAssertTrue(found)
 
         let got = try await received
@@ -45,7 +45,7 @@ final class DispatcherTests: XCTestCase {
 
         async let result: UniversalMessage_RoutableMessage = withCheckedThrowingContinuation { cont in
             do {
-                try box.table.register(uuid: uuid, continuation: cont)
+                try box.table.register(token: uuid, continuation: cont)
             } catch {
                 cont.resume(throwing: error)
             }
@@ -53,7 +53,7 @@ final class DispatcherTests: XCTestCase {
 
         try await Task.sleep(nanoseconds: 10_000_000)
 
-        let found = box.table.fail(uuid: uuid, error: Canary.boom)
+        let found = box.table.fail(token: uuid, error: Canary.boom)
         XCTAssertTrue(found)
 
         do {
@@ -73,7 +73,7 @@ final class DispatcherTests: XCTestCase {
         actor TableActor {
             var table = RequestTable()
             func register(uuid: Data, continuation: RequestTable.Continuation) throws {
-                try table.register(uuid: uuid, continuation: continuation)
+                try table.register(token: uuid, continuation: continuation)
             }
 
             func count() -> Int {
@@ -160,6 +160,14 @@ final class DispatcherTests: XCTestCase {
         var from = UniversalMessage_Destination()
         from.domain = domain
         response.fromDestination = from
+        // Vehicle echoes the client's fromDestination.routingAddress into the
+        // response's toDestination.routingAddress. Dispatcher matches VCSEC
+        // responses on this field (not on requestUuid).
+        if case let .routingAddress(addr)? = request.fromDestination.subDestination {
+            var to = UniversalMessage_Destination()
+            to.routingAddress = addr
+            response.toDestination = to
+        }
 
         let aad = try SessionMetadata.buildResponseAAD(
             message: response,
@@ -425,7 +433,8 @@ final class DispatcherTests: XCTestCase {
         guard case let .sessionInfoRequest(req)? = outboundRequest.payload else {
             XCTFail("expected SessionInfoRequest payload"); return
         }
-        XCTAssertEqual(req.challenge.count, 8, "challenge is 8 random bytes")
+        XCTAssertTrue(req.challenge.isEmpty, "SessionInfoRequest.challenge is unused — vehicle keys the HMAC on RoutableMessage.uuid")
+        XCTAssertEqual(outboundRequest.uuid.count, 16, "RoutableMessage.uuid is the real HMAC challenge")
         XCTAssertTrue(outboundRequest.hasFromDestination, "SessionInfoRequest must set fromDestination")
         guard case let .routingAddress(addr)? = outboundRequest.fromDestination.subDestination else {
             XCTFail("fromDestination must carry a routingAddress"); return
@@ -445,12 +454,13 @@ final class DispatcherTests: XCTestCase {
         let tag = try SessionNegotiator.computeSessionInfoTag(
             sessionKey: sessionKey,
             verifierName: verifierName,
-            challenge: req.challenge,
+            challenge: outboundRequest.uuid,
             encodedInfo: encoded,
         )
 
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = outboundRequest.uuid
+        stampRouting(on: &response, respondingTo: outboundRequest, domain: .vehicleSecurity)
         response.payload = .sessionInfo(encoded)
         var sig = Signatures_SignatureData()
         var hmac = Signatures_HMAC_Signature_Data()
@@ -475,13 +485,11 @@ final class DispatcherTests: XCTestCase {
     /// broadcast that cannot complete a handshake (observed bug on real cars).
     func testSessionNegotiatorBuildRequestSetsRoutingAddress() {
         let publicKey = Data(repeating: 0x04, count: 65)
-        let challenge = Data(repeating: 0xAA, count: 8)
         let routingAddress = Data((0 ..< 16).map { UInt8($0 + 1) })
 
         let message = SessionNegotiator.buildRequest(
             domain: .vehicleSecurity,
             publicKey: publicKey,
-            challenge: challenge,
             uuid: Data([0x01, 0x02]),
             fromRoutingAddress: routingAddress,
         )
@@ -549,6 +557,7 @@ final class DispatcherTests: XCTestCase {
 
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         response.payload = .protobufMessageAsBytes(Data("fromVCSEC".utf8))
         try await transport.enqueueInbound(response.serializedData())
 
@@ -584,6 +593,7 @@ final class DispatcherTests: XCTestCase {
         // Response without a protobufMessageAsBytes payload.
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         // No payload set.
         try await transport.enqueueInbound(response.serializedData())
 
@@ -620,6 +630,7 @@ final class DispatcherTests: XCTestCase {
 
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         // No payload → triggers missing sessionInfo branch.
         try await transport.enqueueInbound(response.serializedData())
 
@@ -655,6 +666,7 @@ final class DispatcherTests: XCTestCase {
         info.publicKey = Data(repeating: 0x04, count: 65)
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         response.payload = try .sessionInfo(info.serializedData())
         // No subSigData → triggers missing signature data branch.
         try await transport.enqueueInbound(response.serializedData())
@@ -691,6 +703,7 @@ final class DispatcherTests: XCTestCase {
         info.publicKey = Data(repeating: 0x04, count: 65)
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         response.payload = try .sessionInfo(info.serializedData())
 
         // Signature present but wrong type (hmacPersonalizedData instead of sessionInfoTag).
@@ -738,6 +751,7 @@ final class DispatcherTests: XCTestCase {
 
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         response.payload = try .sessionInfo(info.serializedData())
 
         var tag = Signatures_HMAC_Signature_Data()
@@ -781,6 +795,7 @@ final class DispatcherTests: XCTestCase {
 
         var response = UniversalMessage_RoutableMessage()
         response.requestUuid = request.uuid
+        stampRouting(on: &response, respondingTo: request, domain: .vehicleSecurity)
         response.payload = try .sessionInfo(info.serializedData())
 
         var tag = Signatures_HMAC_Signature_Data()
@@ -838,6 +853,26 @@ final class DispatcherTests: XCTestCase {
 
     // MARK: - Helpers (coverage tests)
 
+    /// Fill in the routing fields the real dispatcher now requires on inbound
+    /// messages: `fromDestination.domain` tells the inbound loop which
+    /// routing scheme to use; `toDestination.routingAddress` echoes the
+    /// client's request address so VCSEC responses match by address.
+    @available(macOS 13.0, iOS 16.0, *)
+    private func stampRouting(
+        on response: inout UniversalMessage_RoutableMessage,
+        respondingTo request: UniversalMessage_RoutableMessage,
+        domain: UniversalMessage_Domain,
+    ) {
+        var from = UniversalMessage_Destination()
+        from.domain = domain
+        response.fromDestination = from
+        if case let .routingAddress(addr)? = request.fromDestination.subDestination {
+            var to = UniversalMessage_Destination()
+            to.routingAddress = addr
+            response.toDestination = to
+        }
+    }
+
     @available(macOS 13.0, iOS 16.0, *)
     private func waitForFirstOutbound(_ transport: FakeTransport) async throws -> Data {
         for _ in 0 ..< 100 {
@@ -847,6 +882,154 @@ final class DispatcherTests: XCTestCase {
         }
         XCTFail("no outbound message")
         throw Dispatcher.Error.timeout
+    }
+
+    // MARK: - Per-domain routing semantics
+
+    /// VCSEC signed responses are matched on `toDestination.routingAddress`
+    /// rather than `requestUuid`. The real vehicle doesn't reliably echo
+    /// requestUuid for VCSEC command responses, so Swift must route on the
+    /// per-message random address instead — mirrors Go's `dispatcher.go:259`
+    /// skip-UUID-for-VCSEC behavior.
+    @available(macOS 13.0, iOS 16.0, *)
+    func testDispatcherRoutesVCSECByAddressWithEmptyRequestUuid() async throws {
+        let transport = FakeTransport()
+        let dispatcher = Dispatcher(transport: transport)
+        try await dispatcher.start()
+        let session = makeSession(domain: .vehicleSecurity)
+        await dispatcher.installSession(session, forDomain: .vehicleSecurity)
+
+        let sendTask = Task { () throws -> Data in
+            try await dispatcher.send(Data("lock".utf8), domain: .vehicleSecurity, timeout: .seconds(2))
+        }
+
+        let outboundBytes = try await waitForFirstOutbound(transport)
+        let outboundRequest = try UniversalMessage_RoutableMessage(serializedBytes: outboundBytes)
+
+        // Build a response with NO requestUuid. Dispatcher must still route it
+        // back to the pending send by matching toDestination.routingAddress.
+        var response = try UniversalMessage_RoutableMessage(
+            serializedBytes: makeResponseBytes(
+                respondingTo: outboundRequest,
+                plaintext: Data("OK".utf8),
+                counter: 1,
+                sessionKey: makeSessionKey(),
+                verifierName: Data("test_verifier".utf8),
+                domain: .vehicleSecurity,
+            ),
+        )
+        response.requestUuid = Data()
+        try await transport.enqueueInbound(response.serializedData())
+
+        let plaintext = try await sendTask.value
+        XCTAssertEqual(plaintext, Data("OK".utf8))
+
+        await dispatcher.stop()
+    }
+
+    /// Two concurrent Infotainment sends get disambiguated by `requestUuid`,
+    /// not by routing address (which is stable for the domain).
+    @available(macOS 13.0, iOS 16.0, *)
+    func testDispatcherInfotainmentUsesStableAddressAndUUIDMatching() async throws {
+        let transport = FakeTransport()
+        let dispatcher = Dispatcher(transport: transport)
+        try await dispatcher.start()
+        let session = makeSession(domain: .infotainment)
+        await dispatcher.installSession(session, forDomain: .infotainment)
+
+        // Fire two sequential sends and assert they use the SAME routing
+        // address (Go semantics: infotainment reuses d.address).
+        try await dispatcher.sendUnsignedNoReply(Data("a".utf8), domain: .infotainment)
+        try await dispatcher.sendUnsignedNoReply(Data("b".utf8), domain: .infotainment)
+
+        let outbound = await transport.sentMessages
+        XCTAssertEqual(outbound.count, 2)
+        let m0 = try UniversalMessage_RoutableMessage(serializedBytes: outbound[0])
+        let m1 = try UniversalMessage_RoutableMessage(serializedBytes: outbound[1])
+        guard
+            case let .routingAddress(a0)? = m0.fromDestination.subDestination,
+            case let .routingAddress(a1)? = m1.fromDestination.subDestination
+        else {
+            XCTFail("missing routingAddress"); return
+        }
+        XCTAssertEqual(a0, a1, "infotainment reuses a stable per-dispatcher address")
+        XCTAssertNotEqual(m0.uuid, m1.uuid, "per-message uuids still rotate")
+
+        await dispatcher.stop()
+    }
+
+    // MARK: - Fault-driven session resync
+
+    /// When the vehicle attaches a fresh signed SessionInfo to any response
+    /// (typically on a MessageFault), the inbound loop must HMAC-verify it
+    /// and resync the installed session before completing the waiter. The
+    /// waiter then observes the error and the NEXT send will use the new
+    /// epoch/counter/sessionStart.
+    @available(macOS 13.0, iOS 16.0, *)
+    func testDispatcherResyncsSessionFromInboundSessionInfo() async throws {
+        let transport = FakeTransport()
+        let dispatcher = Dispatcher(transport: transport)
+        try await dispatcher.start()
+        let verifierName = Data("test_verifier".utf8)
+        let sessionKey = makeSessionKey()
+
+        // Install a fresh VCSEC session with a known epoch/counter.
+        let session = VehicleSession(
+            domain: .vehicleSecurity,
+            verifierName: verifierName,
+            localPublicKey: Data(repeating: 0x04, count: 65),
+            sessionKey: sessionKey,
+            epoch: Data(repeating: 0x11, count: 16),
+            initialCounter: 5,
+            clockTime: 0,
+        )
+        await dispatcher.installSession(session, forDomain: .vehicleSecurity)
+
+        // Fire a send so there's a pending continuation to route the response to.
+        let sendTask = Task { () throws -> Data in
+            try await dispatcher.send(Data("lock".utf8), domain: .vehicleSecurity, timeout: .seconds(2))
+        }
+        let outboundBytes = try await waitForFirstOutbound(transport)
+        let outboundRequest = try UniversalMessage_RoutableMessage(serializedBytes: outboundBytes)
+
+        // Build a proactive-resync response carrying a new SessionInfo signed
+        // by the same session key. The tag is HMAC keyed on the request uuid.
+        var newInfo = Signatures_SessionInfo()
+        newInfo.counter = 99
+        newInfo.epoch = Data(repeating: 0xCC, count: 16)
+        newInfo.clockTime = 777
+        newInfo.publicKey = Data(repeating: 0x04, count: 65)
+        let encoded = try newInfo.serializedData()
+        let tag = try SessionNegotiator.computeSessionInfoTag(
+            sessionKey: sessionKey,
+            verifierName: verifierName,
+            challenge: outboundRequest.uuid,
+            encodedInfo: encoded,
+        )
+        var response = UniversalMessage_RoutableMessage()
+        response.requestUuid = outboundRequest.uuid
+        stampRouting(on: &response, respondingTo: outboundRequest, domain: .vehicleSecurity)
+        response.payload = .sessionInfo(encoded)
+        var hmacSig = Signatures_HMAC_Signature_Data()
+        hmacSig.tag = tag
+        var sig = Signatures_SignatureData()
+        sig.sigType = .sessionInfoTag(hmacSig)
+        response.subSigData = .signatureData(sig)
+        try await transport.enqueueInbound(response.serializedData())
+
+        // The waiter will fail verification (response is sessionInfo, not
+        // aesGcmResponseData), but that's fine — we only care that the
+        // session resynced BEFORE the waiter got the message.
+        _ = try? await sendTask.value
+
+#if DEBUG
+        let c = await session.currentCounter
+        let e = await session.currentEpoch
+        XCTAssertEqual(c, 99, "counter should be updated from proactive SessionInfo")
+        XCTAssertEqual(e, Data(repeating: 0xCC, count: 16), "epoch should be updated from proactive SessionInfo")
+#endif
+
+        await dispatcher.stop()
     }
 
     /// Two successive sends must use independent random routing addresses —

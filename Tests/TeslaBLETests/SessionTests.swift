@@ -243,7 +243,7 @@ final class SessionTests: XCTestCase {
     func testVehicleSessionSignIncrementsCounter() async throws {
         let session = makeTestSession(initialCounter: 10)
         var message = makeVCSECRequest()
-        try await session.sign(plaintext: Data("a".utf8), into: &message, expiresAt: 60)
+        try await session.sign(plaintext: Data("a".utf8), into: &message, expiresIn: 60)
 
 #if DEBUG
         let counterAfter = await session.currentCounter
@@ -262,7 +262,7 @@ final class SessionTests: XCTestCase {
         let session = makeTestSession(initialCounter: UInt32.max)
         var message = makeVCSECRequest()
         do {
-            try await session.sign(plaintext: Data("a".utf8), into: &message, expiresAt: 60)
+            try await session.sign(plaintext: Data("a".utf8), into: &message, expiresIn: 60)
             XCTFail("expected rollover throw")
         } catch VehicleSession.Error.counterRollover {
             // ok
@@ -277,7 +277,7 @@ final class SessionTests: XCTestCase {
         // Construct a signed request we'll later use as the "request" for
         // requestID computation.
         var request = makeVCSECRequest()
-        try await session.sign(plaintext: Data("req".utf8), into: &request, expiresAt: 60)
+        try await session.sign(plaintext: Data("req".utf8), into: &request, expiresIn: 60)
         let requestID = try XCTUnwrap(InboundVerifier.requestID(forSignedRequest: request))
 
         // Fabricate a response sealed by the same session key.
@@ -326,25 +326,71 @@ final class SessionTests: XCTestCase {
     func testVehicleSessionResyncResetsState() async {
         let session = makeTestSession(initialCounter: 50)
         let newEpoch = Data(repeating: 0xCD, count: 16)
-        await session.resync(epoch: newEpoch, counter: 0)
+        var info = Signatures_SessionInfo()
+        info.epoch = newEpoch
+        info.counter = 0
+        info.clockTime = 1234
+        let handshake = Date(timeIntervalSince1970: 2_000_000)
+        await session.resync(fromSessionInfo: info, handshakeDate: handshake)
 
 #if DEBUG
         let c = await session.currentCounter
         let e = await session.currentEpoch
+        let start = await session.currentSessionStart
         XCTAssertEqual(c, 0)
         XCTAssertEqual(e, newEpoch)
+        XCTAssertEqual(
+            start.timeIntervalSince1970,
+            handshake.timeIntervalSince1970 - 1234,
+            accuracy: 0.001,
+            "sessionStart must rewind by the vehicle-advertised clockTime",
+        )
 #endif
+    }
+
+    func testVehicleSessionSignWritesEpochRelativeExpiresAt() async throws {
+        // Pretend the handshake happened with vehicle clock = 10_000 seconds
+        // into the epoch. Any signed command should be stamped with
+        // `floor(10_000 + ttl)` seconds since that epoch started — matching
+        // Go's `signer.go` `encryptWithCounter` formula.
+        let clockTime: UInt32 = 10000
+        let ttl: TimeInterval = 5
+        let handshake = Date()
+        let session = VehicleSession(
+            domain: .vehicleSecurity,
+            verifierName: Data("test_verifier".utf8),
+            localPublicKey: Data(repeating: 0x04, count: 65),
+            sessionKey: SessionKey(rawBytes: Data(repeating: 0x42, count: 16)),
+            epoch: Data(repeating: 0xAB, count: 16),
+            initialCounter: 0,
+            clockTime: clockTime,
+            handshakeDate: handshake,
+        )
+
+        var message = makeVCSECRequest()
+        try await session.sign(plaintext: Data("go".utf8), into: &message, expiresIn: ttl)
+
+        guard case let .signatureData(s)? = message.subSigData,
+              case let .aesGcmPersonalizedData(gcm) = s.sigType
+        else {
+            XCTFail("missing envelope"); return
+        }
+
+        // Expected ≈ clockTime + ttl; small +/- slack for whatever time
+        // elapsed between the init() call and the sign() call.
+        let expected = Double(clockTime) + ttl
+        let actual = Double(gcm.expiresAt)
+        XCTAssertGreaterThanOrEqual(actual, expected - 1)
+        XCTAssertLessThanOrEqual(actual, expected + 2)
     }
 
     // MARK: - SessionNegotiator
 
     func testSessionNegotiatorBuildsWellFormedRequest() {
         let publicKey = Data(repeating: 0x04, count: 65)
-        let challenge = Data([0, 1, 2, 3, 4, 5, 6, 7])
         let message = SessionNegotiator.buildRequest(
             domain: .vehicleSecurity,
             publicKey: publicKey,
-            challenge: challenge,
             uuid: Data([0xDE, 0xAD]),
             fromRoutingAddress: Data(repeating: 0x11, count: 16),
         )
@@ -354,7 +400,7 @@ final class SessionTests: XCTestCase {
             XCTFail("wrong payload"); return
         }
         XCTAssertEqual(req.publicKey, publicKey)
-        XCTAssertEqual(req.challenge, challenge)
+        XCTAssertTrue(req.challenge.isEmpty)
     }
 
     func testSessionNegotiatorValidatesGoodResponse() throws {

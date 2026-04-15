@@ -5,6 +5,26 @@ import Security
 /// Actor that owns per-domain `VehicleSession` state on top of a `MessageTransport`,
 /// serializing in-flight requests through `RequestTable` for sign/verify + timeout.
 /// Framing and BLE connection lifecycle are the transport's concern, not ours.
+///
+/// ## Routing model (per-domain)
+///
+/// Mirrors `internal/dispatcher/dispatcher.go` in the Go reference. Outbound
+/// requests and inbound response matching both branch on domain:
+///
+/// - **VCSEC:** every outbound message uses a fresh random 16-byte
+///   `fromDestination.routingAddress`, and the request continuation is
+///   registered under THAT address. Inbound VCSEC responses are matched
+///   back by `toDestination.routingAddress` — VCSEC responses do not
+///   reliably echo `request_uuid`, so Go ignores the UUID for this domain
+///   (see `dispatcher.go:259`).
+///
+/// - **Infotainment / other:** every outbound message uses a stable,
+///   per-Dispatcher random `fromDestination.routingAddress` (chosen once
+///   at construction), and the continuation is registered under the
+///   message `uuid`. Inbound responses are matched back by `requestUuid`.
+///
+/// This asymmetry is what the protocol actually needs — single-flight
+/// per VCSEC domain, multi-flight per Infotainment with uuid disambiguation.
 @available(macOS 13.0, iOS 16.0, *)
 actor Dispatcher {
     enum Error: Swift.Error, Equatable {
@@ -22,6 +42,10 @@ actor Dispatcher {
     private let transport: MessageTransport
     private let logger: (any TeslaBLELogger)?
 
+    /// Stable 16-byte routing address used by every Infotainment outbound
+    /// message. Chosen once at construction. Mirrors `d.address` in Go.
+    private let infotainmentAddress: Data
+
     private var vcsecSession: VehicleSession?
     private var infotainmentSession: VehicleSession?
     private var requestTable = RequestTable()
@@ -31,6 +55,7 @@ actor Dispatcher {
     init(transport: MessageTransport, logger: (any TeslaBLELogger)? = nil) {
         self.transport = transport
         self.logger = logger
+        infotainmentAddress = Self.newRoutingAddress()
     }
 
     // MARK: - Lifecycle
@@ -74,24 +99,29 @@ actor Dispatcher {
         guard started else { throw Error.notStarted }
         let session = try requireSession(for: domain)
 
-        // Build an outbound routable message with a fresh uuid.
+        // Pick routing address per domain: VCSEC uses a fresh random addr;
+        // Infotainment reuses the stable per-dispatcher address.
+        let fromAddress = routingAddress(forDomain: domain)
+
         var request = UniversalMessage_RoutableMessage()
         var dst = UniversalMessage_Destination()
         dst.domain = domain
         request.toDestination = dst
         var fromDst = UniversalMessage_Destination()
-        fromDst.routingAddress = Self.newRoutingAddress()
+        fromDst.routingAddress = fromAddress
         request.fromDestination = fromDst
         let requestUUID = Self.newUUIDBytes()
         request.uuid = requestUUID
 
         // Sign (actor hop into VehicleSession).
-        try await session.sign(plaintext: plaintext, into: &request, expiresAt: Self.defaultExpiresAt)
+        try await session.sign(plaintext: plaintext, into: &request, expiresIn: Self.defaultExpiresIn)
 
         // Compute requestID for response matching.
         guard let responseMatchID = InboundVerifier.requestID(forSignedRequest: request) else {
             throw Error.encodingFailed("failed to compute requestID from signed message")
         }
+
+        let token = routeToken(forDomain: domain, uuid: requestUUID, routingAddress: fromAddress)
 
         // Freeze the request before capturing in the Sendable closure.
         let frozenRequest = request
@@ -99,7 +129,7 @@ actor Dispatcher {
         // Register and transmit.
         let response: UniversalMessage_RoutableMessage
         do {
-            response = try await withRegisteredRequest(uuid: requestUUID, timeout: timeout) { [self] in
+            response = try await withRegisteredRequest(token: token, timeout: timeout) { [self] in
                 try await transmit(message: frozenRequest)
             }
         } catch let e as Error where e == .timeout {
@@ -126,23 +156,26 @@ actor Dispatcher {
     ) async throws -> Data {
         guard started else { throw Error.notStarted }
 
+        let fromAddress = routingAddress(forDomain: domain)
+
         var request = UniversalMessage_RoutableMessage()
         var dst = UniversalMessage_Destination()
         dst.domain = domain
         request.toDestination = dst
         var fromDst = UniversalMessage_Destination()
-        fromDst.routingAddress = Self.newRoutingAddress()
+        fromDst.routingAddress = fromAddress
         request.fromDestination = fromDst
         let requestUUID = Self.newUUIDBytes()
         request.uuid = requestUUID
         request.payload = .protobufMessageAsBytes(plaintext)
         // No subSigData — unsigned.
 
+        let token = routeToken(forDomain: domain, uuid: requestUUID, routingAddress: fromAddress)
         let frozenRequest = request
 
         let response: UniversalMessage_RoutableMessage
         do {
-            response = try await withRegisteredRequest(uuid: requestUUID, timeout: timeout) { [self] in
+            response = try await withRegisteredRequest(token: token, timeout: timeout) { [self] in
                 try await transmit(message: frozenRequest)
             }
         } catch let e as Error where e == .timeout {
@@ -176,7 +209,7 @@ actor Dispatcher {
         dst.domain = domain
         request.toDestination = dst
         var fromDst = UniversalMessage_Destination()
-        fromDst.routingAddress = Self.newRoutingAddress()
+        fromDst.routingAddress = routingAddress(forDomain: domain)
         request.fromDestination = fromDst
         request.uuid = Self.newUUIDBytes()
         request.payload = .protobufMessageAsBytes(plaintext)
@@ -216,26 +249,28 @@ actor Dispatcher {
         verifierName: Data,
         timeout: Duration,
     ) async throws -> (sessionInfo: Signatures_SessionInfo, sessionKey: SessionKey) {
-        // Challenge: 8 random bytes (matches Go test helper).
-        var challenge = Data(count: 8)
-        let challengeCount = challenge.count
-        challenge.withUnsafeMutableBytes { buffer in
-            _ = SecRandomCopyBytes(kSecRandomDefault, challengeCount, buffer.baseAddress!)
-        }
-
         // Local public key in uncompressed SEC1 form (0x04 || X || Y, 65 bytes).
         let localPublicKey = localPrivateKey.publicKey.x963Representation
 
+        // The vehicle keys the SessionInfo HMAC on the RoutableMessage.uuid of
+        // the request (echoed back in the response as `request_uuid`). See
+        // `internal/dispatcher/dispatcher.go:219` — `processHello` is called
+        // with `message.GetRequestUuid()` as the challenge. The HMAC challenge
+        // is always the uuid regardless of which token (address or uuid) is
+        // used for inbound routing matching.
+        let requestUUID = Self.newUUIDBytes()
+        let fromAddress = routingAddress(forDomain: domain)
         let request = SessionNegotiator.buildRequest(
             domain: domain,
             publicKey: localPublicKey,
-            challenge: challenge,
-            uuid: Self.newUUIDBytes(),
-            fromRoutingAddress: Self.newRoutingAddress(),
+            uuid: requestUUID,
+            fromRoutingAddress: fromAddress,
         )
+        let challenge = requestUUID
+        let token = routeToken(forDomain: domain, uuid: requestUUID, routingAddress: fromAddress)
 
         let response: UniversalMessage_RoutableMessage = try await withRegisteredRequest(
-            uuid: request.uuid,
+            token: token,
             timeout: timeout,
         ) { [self] in
             try await transmit(message: request)
@@ -311,6 +346,59 @@ actor Dispatcher {
         }
     }
 
+    private func session(forDomain domain: UniversalMessage_Domain) -> VehicleSession? {
+        switch domain {
+        case .vehicleSecurity: vcsecSession
+        case .infotainment: infotainmentSession
+        default: nil
+        }
+    }
+
+    /// Pick the outbound routing address for a domain. VCSEC gets a fresh
+    /// random 16-byte address per message; every other domain reuses the
+    /// stable per-dispatcher `infotainmentAddress`.
+    private func routingAddress(forDomain domain: UniversalMessage_Domain) -> Data {
+        switch domain {
+        case .vehicleSecurity: Self.newRoutingAddress()
+        default: infotainmentAddress
+        }
+    }
+
+    /// Pick the request-table lookup key for a domain. VCSEC is keyed by
+    /// the random per-message routing address; every other domain is keyed
+    /// by the message `uuid`.
+    private func routeToken(
+        forDomain domain: UniversalMessage_Domain,
+        uuid: Data,
+        routingAddress: Data,
+    ) -> Data {
+        switch domain {
+        case .vehicleSecurity: routingAddress
+        default: uuid
+        }
+    }
+
+    /// Extract the request-table lookup key from an inbound message, based
+    /// on its `fromDestination.domain`. Mirrors how Go's `dispatcher.go:259`
+    /// decides whether to include the UUID in the lookup key.
+    private func inboundToken(for message: UniversalMessage_RoutableMessage) -> Data? {
+        let fromDomain = message.hasFromDestination ? message.fromDestination.domain : .broadcast
+        switch fromDomain {
+        case .vehicleSecurity:
+            // VCSEC: match by the routing address the vehicle echoes back
+            // in toDestination. No UUID check.
+            guard message.hasToDestination else { return nil }
+            guard case let .routingAddress(addr)? = message.toDestination.subDestination else {
+                return nil
+            }
+            return addr.isEmpty ? nil : addr
+        default:
+            // Infotainment / other: match by echoed request_uuid.
+            let uuid = message.requestUuid
+            return uuid.isEmpty ? nil : uuid
+        }
+    }
+
     private func transmit(message: UniversalMessage_RoutableMessage) async throws {
         let bytes: Data
         do {
@@ -322,16 +410,16 @@ actor Dispatcher {
     }
 
     /// Registers a continuation before firing `transmit` so that an early
-    /// response cannot arrive at an unregistered uuid. Completion races the
-    /// inbound loop, the timeout task, and `stop()` / `cancelAll`.
+    /// response cannot arrive at an unregistered token. Completion races
+    /// the inbound loop, the timeout task, and `stop()` / `cancelAll`.
     private func withRegisteredRequest(
-        uuid: Data,
+        token: Data,
         timeout: Duration,
         transmit: @Sendable @escaping () async throws -> Void,
     ) async throws -> UniversalMessage_RoutableMessage {
         try await withCheckedThrowingContinuation { (cont: RequestTable.Continuation) in
             do {
-                try requestTable.register(uuid: uuid, continuation: cont)
+                try requestTable.register(token: token, continuation: cont)
             } catch {
                 cont.resume(throwing: error)
                 return
@@ -343,25 +431,25 @@ actor Dispatcher {
                 do {
                     try await transmit()
                 } catch {
-                    await self?.failRequest(uuid: uuid, error: error)
+                    await self?.failRequest(token: token, error: error)
                     return
                 }
 
                 do {
                     try await Task.sleep(nanoseconds: Self.durationToNanoseconds(timeout))
-                    await self?.failRequest(uuid: uuid, error: Error.timeout)
+                    await self?.failRequest(token: token, error: Error.timeout)
                 } catch {
                     // Task cancelled — the continuation may already have been
                     // completed by the inbound loop; attempt to fail is a
-                    // no-op if the uuid is already unregistered.
-                    await self?.failRequest(uuid: uuid, error: CancellationError())
+                    // no-op if the token is already unregistered.
+                    await self?.failRequest(token: token, error: CancellationError())
                 }
             }
         }
     }
 
-    private func failRequest(uuid: Data, error: Swift.Error) {
-        _ = requestTable.fail(uuid: uuid, error: error)
+    private func failRequest(token: Data, error: Swift.Error) {
+        _ = requestTable.fail(token: token, error: error)
     }
 
     // MARK: - Inbound loop
@@ -385,32 +473,101 @@ actor Dispatcher {
                 continue
             }
 
-            let matchUUID = message.requestUuid
-            if !matchUUID.isEmpty {
-                let routed = requestTable.complete(uuid: matchUUID, with: message)
-                if !routed {
-                    logger?.log(.warning, category: "dispatcher", "no pending request for uuid \(matchUUID.map { String(format: "%02x", $0) }.joined()); dropping")
-                }
-            } else {
-                logger?.log(.debug, category: "dispatcher", "unsolicited inbound message (no requestUuid); dropping")
+            // Proactive / fault-triggered session resync. Vehicles may attach
+            // a fresh (HMAC-signed) SessionInfo to any response if they think
+            // the session is desynced — typically alongside a MessageFault —
+            // so the client can recover without a full re-handshake. See
+            // `internal/dispatcher/dispatcher.go:182` `checkForSessionUpdate`.
+            // We only act on this when an established session exists for the
+            // inbound domain; the initial `negotiate()` path handles its own
+            // HMAC verification and installs the session itself.
+            await maybeResyncFromInbound(message)
+
+            guard let token = inboundToken(for: message) else {
+                logger?.log(.debug, category: "dispatcher", "unroutable inbound message (no token); dropping")
+                continue
+            }
+            let routed = requestTable.complete(token: token, with: message)
+            if !routed {
+                logger?.log(
+                    .warning,
+                    category: "dispatcher",
+                    "no pending request for token \(token.map { String(format: "%02x", $0) }.joined()); dropping",
+                )
             }
         }
     }
 
+    /// Verify and apply a vehicle-sent session-info update attached to an
+    /// inbound response. Silently returns if the message has no sessionInfo
+    /// payload, no session is installed for the domain, or the HMAC does
+    /// not match.
+    private func maybeResyncFromInbound(_ message: UniversalMessage_RoutableMessage) async {
+        guard case let .sessionInfo(encodedInfo)? = message.payload else { return }
+        guard case let .signatureData(sigData)? = message.subSigData else { return }
+        guard case let .sessionInfoTag(hmacSig)? = sigData.sigType else { return }
+
+        let fromDomain = message.hasFromDestination ? message.fromDestination.domain : .broadcast
+        guard let targetSession = session(forDomain: fromDomain) else { return }
+
+        // HMAC challenge is the request uuid echoed back on the response.
+        // For VCSEC responses this is the only place Swift uses the field.
+        let challenge = message.requestUuid
+        guard !challenge.isEmpty else {
+            logger?.log(.warning, category: "dispatcher", "proactive sessionInfo has empty requestUuid; skipping resync")
+            return
+        }
+
+        let info: Signatures_SessionInfo
+        do {
+            info = try Signatures_SessionInfo(serializedBytes: encodedInfo)
+        } catch {
+            logger?.log(.warning, category: "dispatcher", "proactive sessionInfo decode failed: \(error)")
+            return
+        }
+
+        let verifierName = targetSession.verifierName
+        let sessionKey = targetSession.sessionKey
+
+        let computedTag: Data
+        do {
+            computedTag = try SessionNegotiator.computeSessionInfoTag(
+                sessionKey: sessionKey,
+                verifierName: verifierName,
+                challenge: challenge,
+                encodedInfo: encodedInfo,
+            )
+        } catch {
+            logger?.log(.warning, category: "dispatcher", "proactive sessionInfo HMAC compute failed: \(error)")
+            return
+        }
+        guard Self.constantTimeEqual(computedTag, hmacSig.tag) else {
+            logger?.log(.warning, category: "dispatcher", "proactive sessionInfo HMAC mismatch; ignoring")
+            return
+        }
+
+        await targetSession.resync(fromSessionInfo: info)
+        logger?.log(.info, category: "dispatcher", "session resynced from inbound sessionInfo on \(fromDomain)")
+    }
+
     // MARK: - Constants & helpers
 
-    private static let defaultExpiresAt: UInt32 = 60
+    /// Default relative TTL for signed commands. Matches Go's
+    /// `defaultExpiration = 5 * time.Second` in `internal/dispatcher/session.go`.
+    /// The absolute `expiresAt` on the wire is computed by `VehicleSession`
+    /// relative to `sessionStart`, not written as a raw constant here.
+    private static let defaultExpiresIn: TimeInterval = 5
 
     private static func newUUIDBytes() -> Data {
         var uuid = UUID().uuid
         return withUnsafeBytes(of: &uuid) { Data($0) }
     }
 
-    /// 16-byte random "from" address placed on every outbound
-    /// `RoutableMessage.fromDestination.routingAddress`. Vehicles use this to
-    /// route the reply back and fold it into the session-info HMAC metadata —
-    /// messages without one get answered with an unsigned SessionInfo broadcast
-    /// that can never complete a handshake.
+    /// 16-byte random "from" address. Vehicles fold
+    /// `fromDestination.routingAddress` into the session-info HMAC metadata
+    /// and echo it on the reply in `toDestination.routingAddress` —
+    /// messages without one get answered with an unsigned SessionInfo
+    /// broadcast that can never complete a handshake.
     static func newRoutingAddress() -> Data {
         var bytes = Data(count: 16)
         let count = bytes.count

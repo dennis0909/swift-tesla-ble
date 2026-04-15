@@ -31,19 +31,21 @@ enum SessionNegotiator {
         case decodeFailed(String)
     }
 
-    /// Build an outbound `SessionInfoRequest` for the given domain. Caller is
-    /// responsible for generating a fresh `challenge` (8 random bytes is
-    /// standard — see `getGCMVerifierAndSigner` in peer_test.go).
+    /// Build an outbound `SessionInfoRequest` for the given domain.
+    ///
+    /// The vehicle keys the `SessionInfo` response HMAC on the
+    /// `RoutableMessage.uuid` of this request — not on `SessionInfoRequest.challenge`,
+    /// which the Go reference client (`internal/dispatcher/dispatcher.go:464`)
+    /// leaves unset. So the caller must supply a 16-byte `uuid` and use that
+    /// same value as the `challenge` when verifying the response.
     static func buildRequest(
         domain: UniversalMessage_Domain,
         publicKey: Data,
-        challenge: Data,
-        uuid: Data = Data(),
+        uuid: Data,
         fromRoutingAddress: Data,
     ) -> UniversalMessage_RoutableMessage {
         var request = UniversalMessage_SessionInfoRequest()
         request.publicKey = publicKey
-        request.challenge = challenge
 
         var destination = UniversalMessage_Destination()
         destination.domain = domain

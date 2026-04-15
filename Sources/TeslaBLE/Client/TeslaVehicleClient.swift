@@ -381,6 +381,7 @@ public actor TeslaVehicleClient {
                 sessionKey: negotiated.sessionKey,
                 epoch: negotiated.sessionInfo.epoch,
                 initialCounter: negotiated.sessionInfo.counter,
+                clockTime: negotiated.sessionInfo.clockTime,
             )
             await dispatcher.installSession(session, forDomain: domain)
         }
