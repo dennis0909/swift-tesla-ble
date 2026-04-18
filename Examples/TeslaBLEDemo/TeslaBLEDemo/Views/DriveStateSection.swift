@@ -19,11 +19,15 @@ struct DriveStateSection: View {
                 row("Gear", value: gearString)
 
                 row("Speed", value: speedString)
+                    .contentTransition(.numericText(value: drive?.speedMph ?? 0))
 
                 row("Power", value: powerString)
+                    .contentTransition(.numericText(value: Double(drive?.powerKW ?? 0)))
 
                 row("Odometer", value: odometerString)
             }
+            .animation(.linear(duration: 0.3), value: drive?.speedMph)
+            .animation(.linear(duration: 0.3), value: drive?.powerKW)
         }
     }
 

@@ -9,11 +9,13 @@ import SwiftUI
 import TeslaBLE
 
 struct DashboardView: View {
-    @Environment(VehicleController.self)
-    private var controller
+    @Bindable var controller: VehicleController
 
     @Environment(\.scenePhase)
     private var scenePhase
+
+    @Environment(\.verticalSizeClass)
+    private var verticalSizeClass
 
     @State
     private var isUnlocking = false
@@ -25,6 +27,29 @@ struct DashboardView: View {
     private var showForgetConfirm = false
 
     var body: some View {
+        // Wrap in a stable container so rotation-driven branch swaps don't
+        // re-fire .task / .onDisappear and tear down the BLE session.
+        ZStack {
+            if verticalSizeClass == .compact {
+                InstrumentClusterView(drive: controller.drive, charge: controller.charge)
+            } else {
+                portraitList
+            }
+        }
+        .task { await controller.connect() }
+        .onDisappear { Task { await controller.disconnect() } }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: Task { await controller.disconnect() }
+            case .active: Task { await controller.connect() }
+            default: break
+            }
+        }
+    }
+
+    // MARK: - Portrait List
+
+    private var portraitList: some View {
         List {
             Section("Status") {
                 ConnectionStatusRow(state: controller.connectionState)
@@ -38,17 +63,28 @@ struct DashboardView: View {
                 }
 
                 LabeledContent {
-                    Toggle(
-                        "",
-                        isOn: .init(
-                            get: { controller.isLive },
-                            set: { controller.setLive($0) },
-                        ),
-                    )
-                    .labelsHidden()
+                    Toggle("", isOn: $controller.isLive)
+                        .labelsHidden()
                 } label: {
                     Label("Live", systemImage: "play.fill")
                 }
+                .disabled(controller.connectionState != .connected)
+
+                Stepper(
+                    "Drive poll: \(controller.drivePollMs) ms",
+                    value: $controller.drivePollMs,
+                    in: 100 ... 5000,
+                    step: 100,
+                )
+                .disabled(controller.connectionState != .connected)
+
+                Stepper(
+                    "Charge poll: \(controller.chargePollSec) s",
+                    value: $controller.chargePollSec,
+                    in: 1 ... 60,
+                    step: 1,
+                )
+                .disabled(controller.connectionState != .connected)
             }
 
             DriveStateSection(drive: controller.drive)
@@ -97,7 +133,10 @@ struct DashboardView: View {
                 Text("Removes the stored key and VIN. You will need to pair again.")
             }
         }
-        .refreshable { await controller.refreshDrive() }
+        .refreshable {
+            await controller.refreshDrive()
+            await controller.refreshCharge()
+        }
         .navigationTitle("Dashboard")
         .alert(
             "Forget this vehicle?",
@@ -113,23 +152,13 @@ struct DashboardView: View {
         } message: {
             Text("This will remove the stored key and VIN from this device. You will need to pair again to control this vehicle.")
         }
-        .task { await controller.connect() }
-        .onDisappear { Task { await controller.disconnect() } }
-        .onChange(of: scenePhase) { _, phase in
-            switch phase {
-            case .background: Task { await controller.disconnect() }
-            case .active: Task { await controller.connect() }
-            default: break
-            }
-        }
     }
 }
 
 #if DEBUG
 
 #Preview {
-    DashboardView()
-        .environment(VehicleController())
+    DashboardView(controller: VehicleController())
 }
 
 #endif

@@ -17,7 +17,7 @@ struct RootView: View {
         NavigationStack {
             Group {
                 if controller.pairedVIN != nil {
-                    DashboardView()
+                    DashboardView(controller: controller)
                 } else {
                     PairingView()
                 }
