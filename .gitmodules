@@ -1,4 +1,0 @@
-[submodule "Vendor/tesla-vehicle-command"]
-	path = Vendor/tesla-vehicle-command
-	url = https://github.com/teslamotors/vehicle-command
-	ignore = all
