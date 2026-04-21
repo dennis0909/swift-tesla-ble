@@ -87,6 +87,10 @@ enum VehicleSnapshotMapper {
             ? Double(pb.activeRouteMinutesToArrival) : nil
         let milesToArrival: Double? = pb.optionalActiveRouteMilesToArrival != nil
             ? Double(pb.activeRouteMilesToArrival) : nil
+        let energyAtArrival: Double? = pb.optionalActiveRouteEnergyAtArrival != nil
+            ? Double(pb.activeRouteEnergyAtArrival) : nil
+        let trafficDelay: Double? = pb.optionalActiveRouteTrafficMinutesDelay != nil
+            ? Double(pb.activeRouteTrafficMinutesDelay) : nil
 
         return DriveState(
             shiftState: shiftState,
@@ -96,6 +100,8 @@ enum VehicleSnapshotMapper {
             activeRouteDestination: destination,
             activeRouteMinutesToArrival: minutesToArrival,
             activeRouteMilesToArrival: milesToArrival,
+            activeRouteEnergyAtArrival: energyAtArrival,
+            activeRouteTrafficMinutesDelay: trafficDelay,
         )
     }
 
