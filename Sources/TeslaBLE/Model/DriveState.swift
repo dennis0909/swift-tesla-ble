@@ -20,6 +20,10 @@ public struct DriveState: Sendable, Equatable {
     public var activeRouteEnergyAtArrival: Double?
     /// Traffic delay in minutes on the active route. Nil if the vehicle did not report this field.
     public var activeRouteTrafficMinutesDelay: Double?
+    /// Destination latitude on the active route. Nil if the vehicle did not report this field.
+    public var activeRouteLatitude: Double?
+    /// Destination longitude on the active route. Nil if the vehicle did not report this field.
+    public var activeRouteLongitude: Double?
 
     /// Transmission gear position.
     public enum ShiftState: Sendable, Equatable {
@@ -43,6 +47,8 @@ public struct DriveState: Sendable, Equatable {
         activeRouteMilesToArrival: Double? = nil,
         activeRouteEnergyAtArrival: Double? = nil,
         activeRouteTrafficMinutesDelay: Double? = nil,
+        activeRouteLatitude: Double? = nil,
+        activeRouteLongitude: Double? = nil,
     ) {
         self.shiftState = shiftState
         self.speedMph = speedMph
@@ -53,5 +59,7 @@ public struct DriveState: Sendable, Equatable {
         self.activeRouteMilesToArrival = activeRouteMilesToArrival
         self.activeRouteEnergyAtArrival = activeRouteEnergyAtArrival
         self.activeRouteTrafficMinutesDelay = activeRouteTrafficMinutesDelay
+        self.activeRouteLatitude = activeRouteLatitude
+        self.activeRouteLongitude = activeRouteLongitude
     }
 }
